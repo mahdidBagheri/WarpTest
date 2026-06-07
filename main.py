@@ -24,6 +24,9 @@ Usage examples:
     # Ask Docker Compose to restart/recreate warproxy, then verify the proxy IP.
     python main.py rotate-warproxy --recreate
 
+    # Rotate warproxy before each request and verify 10 unique proxied IPs.
+    python main.py rotate-requests --count 10 --recreate
+
 Install dependencies first, unless you use the Docker image or Compose services:
     python -m pip install -r requirements.txt
 """
@@ -177,6 +180,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional docker-compose.yml path. Can be provided more than once.",
     )
     rotate_parser.add_argument(
+        "--project-directory",
+        help="Optional Docker Compose project directory to pass through.",
+    )
+
+    rotate_requests_parser = subparsers.add_parser(
+        "rotate-requests",
+        help="Rotate warproxy before each request and verify the proxied IPs are unique.",
+    )
+    add_proxy_arguments(rotate_requests_parser)
+    rotate_requests_parser.add_argument(
+        "--url",
+        default=DEFAULT_TEST_URL,
+        help=(
+            "URL to request through the proxy. It must return JSON with an 'ip' "
+            f"field for verification. Defaults to {DEFAULT_TEST_URL!r}."
+        ),
+    )
+    rotate_requests_parser.add_argument(
+        "--count",
+        type=int,
+        default=10,
+        help="Number of rotate-and-request attempts to run. Defaults to 10.",
+    )
+    rotate_requests_parser.add_argument(
+        "--retries",
+        type=int,
+        default=12,
+        help="Number of post-rotation proxy check attempts per request. Defaults to 12.",
+    )
+    rotate_requests_parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between post-rotation proxy checks. Defaults to 5.",
+    )
+    rotate_requests_parser.add_argument(
+        "--service",
+        default="warproxy",
+        help="Docker Compose service to restart/recreate. Defaults to 'warproxy'.",
+    )
+    rotate_requests_parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Use `docker compose up -d --force-recreate` instead of `docker compose restart`.",
+    )
+    rotate_requests_parser.add_argument(
+        "--compose-file",
+        action="append",
+        default=[],
+        help="Optional docker-compose.yml path. Can be provided more than once.",
+    )
+    rotate_requests_parser.add_argument(
         "--project-directory",
         help="Optional Docker Compose project directory to pass through.",
     )
@@ -366,21 +421,8 @@ def build_compose_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
-    """Restart/recreate warproxy and report whether the proxied IP changed."""
-    print(f"Checking proxy IP before rotating {args.service!r}...")
-    before_result = fetch_proxy_ip_with_retries(
-        args.url,
-        args.proxy,
-        args.timeout,
-        retries=1,
-        retry_delay=args.retry_delay,
-        requests_module=requests_module,
-    )
-    before_ip = extract_ip(before_result)
-    print(f"Proxy IP before rotation: {before_ip if before_ip else 'unavailable'}")
-
-    command = build_compose_command(args)
+def run_compose_command(command: list[str]) -> int:
+    """Run Docker Compose and return its exit code, with a clear Docker-missing error."""
     print(f"Running: {' '.join(command)}")
     try:
         completed = subprocess.run(command, check=False)
@@ -397,7 +439,27 @@ def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
             f"Docker Compose command failed with exit code {completed.returncode}.",
             file=sys.stderr,
         )
-        return completed.returncode
+    return completed.returncode
+
+
+def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
+    """Restart/recreate warproxy and report whether the proxied IP changed."""
+    print(f"Checking proxy IP before rotating {args.service!r}...")
+    before_result = fetch_proxy_ip_with_retries(
+        args.url,
+        args.proxy,
+        args.timeout,
+        retries=1,
+        retry_delay=args.retry_delay,
+        requests_module=requests_module,
+    )
+    before_ip = extract_ip(before_result)
+    print(f"Proxy IP before rotation: {before_ip if before_ip else 'unavailable'}")
+
+    command = build_compose_command(args)
+    compose_exit_code = run_compose_command(command)
+    if compose_exit_code != 0:
+        return compose_exit_code
 
     print(f"Waiting for proxy {args.proxy!r} after rotation...")
     after_result = fetch_proxy_ip_with_retries(
@@ -424,6 +486,77 @@ def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
     else:
         print("warproxy rotation completed and the proxy is responding.")
 
+    return 0
+
+
+def run_rotate_requests(args: argparse.Namespace, requests_module: Any) -> int:
+    """Rotate warproxy before each request and verify every observed IP is unique."""
+    if args.count < 1:
+        print("--count must be at least 1.", file=sys.stderr)
+        return 2
+
+    print(
+        f"Sending {args.count} proxied request(s) to {args.url!r}, "
+        f"rotating {args.service!r} before each request."
+    )
+    print(
+        "Note: Cloudflare WARP chooses the egress IP; rotating warproxy cannot "
+        "guarantee a new IP every time."
+    )
+
+    observed_ips: list[str] = []
+    failures = 0
+    for request_number in range(1, args.count + 1):
+        print(f"\nRequest {request_number}/{args.count}: rotating {args.service!r}...")
+        compose_exit_code = run_compose_command(build_compose_command(args))
+        if compose_exit_code != 0:
+            return compose_exit_code
+
+        result = fetch_proxy_ip_with_retries(
+            args.url,
+            args.proxy,
+            args.timeout,
+            args.retries,
+            args.retry_delay,
+            requests_module,
+        )
+        ip_address = extract_ip(result)
+        if not ip_address:
+            failures += 1
+            print(f"Request {request_number}: FAILED no 'ip' field in response: {result}")
+            continue
+
+        is_duplicate = ip_address in observed_ips
+        previous_ip = observed_ips[-1] if observed_ips else None
+        changed = previous_ip is None or ip_address != previous_ip
+        observed_ips.append(ip_address)
+        print(
+            f"Request {request_number}: ip={ip_address} "
+            f"changed_from_previous={'n/a' if previous_ip is None else changed} "
+            f"unique_so_far={not is_duplicate}"
+        )
+        if is_duplicate:
+            failures += 1
+
+    unique_ips = list(dict.fromkeys(observed_ips))
+    print("\nObserved proxied IPs:")
+    for index, ip_address in enumerate(observed_ips, start=1):
+        duplicate_marker = (
+            " (duplicate)" if observed_ips.index(ip_address) != index - 1 else ""
+        )
+        print(f"  {index:02d}. {ip_address}{duplicate_marker}")
+
+    if failures:
+        print(
+            f"IP rotation verification failed: saw {len(unique_ips)} unique IP(s) "
+            f"across {args.count} request(s)."
+        )
+        return 1
+
+    print(
+        f"Success: all {args.count} proxied request(s) used unique IPs "
+        "after warproxy rotation."
+    )
     return 0
 
 
@@ -566,7 +699,8 @@ def normalize_args(raw_args: list[str]) -> list[str]:
     and lets Docker Compose users run `docker compose ... gemini --prompt hi`
     even though Compose replaces the service command when extra args are given.
     """
-    if any(arg in {"test-proxy", "gemini", "rotate-warproxy"} for arg in raw_args):
+    known_commands = {"test-proxy", "gemini", "rotate-warproxy", "rotate-requests"}
+    if any(arg in known_commands for arg in raw_args):
         return raw_args
     if any(arg in {"-h", "--help"} for arg in raw_args):
         return raw_args
@@ -609,6 +743,8 @@ def main() -> int:
 
     if args.command == "rotate-warproxy":
         return run_rotate_warproxy(args, requests)
+    if args.command == "rotate-requests":
+        return run_rotate_requests(args, requests)
     return run_proxy_test(args, requests)
 
 
