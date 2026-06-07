@@ -19,7 +19,7 @@ Usage examples:
     echo "Write a haiku about proxies" | python main.py gemini
 
     docker compose --profile test up --build --abort-on-container-exit proxy-test
-    docker compose --profile gemini run --rm gemini gemini --prompt "Hello from Gemini"
+    docker compose --profile gemini run --rm gemini --prompt "hi"
 
 Install dependencies first, unless you use the Docker image or Compose services:
     python -m pip install -r requirements.txt
@@ -375,8 +375,28 @@ def run_gemini(args: argparse.Namespace) -> int:
     return 0
 
 
+GEMINI_OPTION_NAMES = {
+    "--api-key-env",
+    "--max-output-tokens",
+    "--model",
+    "--prompt",
+    "--prompt-file",
+    "--temperature",
+}
+
+
+def option_name(arg: str) -> str:
+    """Return an argparse option name without any inline value."""
+    return arg.split("=", 1)[0]
+
+
 def normalize_args(raw_args: list[str]) -> list[str]:
-    """Keep old `python main.py --proxy ...` usage working by adding test-proxy."""
+    """Add the most likely subcommand when callers omit it.
+
+    This keeps old `python main.py --proxy ...` usage working as `test-proxy`,
+    and lets Docker Compose users run `docker compose ... gemini --prompt hi`
+    even though Compose replaces the service command when extra args are given.
+    """
     if any(arg in {"test-proxy", "gemini"} for arg in raw_args):
         return raw_args
     if any(arg in {"-h", "--help"} for arg in raw_args):
@@ -391,7 +411,13 @@ def normalize_args(raw_args: list[str]) -> list[str]:
         global_args = remaining[:1]
         remaining = remaining[1:]
 
-    return [*global_args, "test-proxy", *remaining]
+    command = "gemini" if is_gemini_command(remaining) else "test-proxy"
+    return [*global_args, command, *remaining]
+
+
+def is_gemini_command(args: list[str]) -> bool:
+    """Infer the Gemini subcommand when Gemini-only options are present."""
+    return any(option_name(arg) in GEMINI_OPTION_NAMES for arg in args)
 
 
 def main() -> int:
