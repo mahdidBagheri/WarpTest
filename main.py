@@ -7,6 +7,7 @@ Usage examples:
     WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py test-proxy
 
     # Send a prompt to Gemini through warproxy. Put GEMINI_API_KEY in .env first.
+    python main.py gemini --prompt "hi" --model gemini-3.5-flash
     python main.py gemini --prompt "Explain WARP in one sentence."
     python main.py gemini --model gemini-2.5-flash --prompt-file prompt.txt
     echo "Write a haiku about proxies" | python main.py gemini
@@ -21,6 +22,7 @@ Install dependencies first, unless you use the Docker image or Compose services:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 import time
@@ -30,8 +32,7 @@ from typing import Any
 
 DEFAULT_PROXY_URL = "socks5h://127.0.0.1:1080"
 DEFAULT_TEST_URL = "https://api.ipify.org?format=json"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 
 def load_env_file(env_file: str) -> None:
@@ -40,15 +41,15 @@ def load_env_file(env_file: str) -> None:
     if not env_path.exists():
         return
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError:
+    if importlib.util.find_spec("dotenv") is None:
         print(
             "Warning: .env file found but python-dotenv is not installed. "
             "Install dependencies with: python -m pip install -r requirements.txt",
             file=sys.stderr,
         )
         return
+
+    from dotenv import load_dotenv
 
     load_dotenv(env_path)
 
@@ -198,50 +199,34 @@ def read_prompt(prompt: str | None, prompt_file: str | None) -> str:
     return sys.stdin.read()
 
 
-def build_gemini_payload(
-    prompt: str,
+def build_genai_client(api_key: str, proxy_url: str, genai_module: Any) -> Any:
+    """Create a Google Gen AI SDK client configured for warproxy."""
+    http_options = {
+        "client_args": {"proxy": proxy_url},
+        "async_client_args": {"proxy": proxy_url},
+    }
+    return genai_module.Client(api_key=api_key, http_options=http_options)
+
+
+def build_generation_config(
     temperature: float | None,
     max_output_tokens: int | None,
-) -> dict[str, Any]:
-    """Create the Gemini generateContent JSON payload."""
-    payload: dict[str, Any] = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ]
-    }
-
+) -> dict[str, Any] | None:
+    """Create optional Google Gen AI SDK generation config values."""
     generation_config: dict[str, Any] = {}
     if temperature is not None:
         generation_config["temperature"] = temperature
     if max_output_tokens is not None:
-        generation_config["maxOutputTokens"] = max_output_tokens
-    if generation_config:
-        payload["generationConfig"] = generation_config
-
-    return payload
+        generation_config["max_output_tokens"] = max_output_tokens
+    return generation_config or None
 
 
-def extract_gemini_text(response_json: dict[str, Any]) -> str:
-    """Extract text parts from a Gemini generateContent response."""
-    text_parts: list[str] = []
-    for candidate in response_json.get("candidates", []):
-        content = candidate.get("content", {})
-        for part in content.get("parts", []):
-            text = part.get("text")
-            if text:
-                text_parts.append(text)
-
-    if text_parts:
-        return "\n".join(text_parts)
-
-    prompt_feedback = response_json.get("promptFeedback")
-    if prompt_feedback:
-        return f"Gemini returned no text. promptFeedback={prompt_feedback}"
-
-    return f"Gemini returned no text. Full response: {response_json}"
+def extract_gemini_text(response: Any) -> str:
+    """Extract text from a Google Gen AI SDK generate_content response."""
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    return f"Gemini returned no text. Full response: {response}"
 
 
 def call_gemini(
@@ -249,22 +234,22 @@ def call_gemini(
     api_key: str,
     model: str,
     proxy_url: str,
-    timeout: float,
     temperature: float | None,
     max_output_tokens: int | None,
-    requests_module: Any,
+    genai_module: Any,
 ) -> str:
     """Send a prompt to Gemini through the configured proxy and return generated text."""
-    endpoint = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
-    response = requests_module.post(
-        endpoint,
-        params={"key": api_key},
-        json=build_gemini_payload(prompt, temperature, max_output_tokens),
-        proxies=build_proxies(proxy_url),
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    return extract_gemini_text(response.json())
+    client = build_genai_client(api_key, proxy_url, genai_module)
+    config = build_generation_config(temperature, max_output_tokens)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "contents": prompt,
+    }
+    if config is not None:
+        kwargs["config"] = config
+
+    response = client.models.generate_content(**kwargs)
+    return extract_gemini_text(response)
 
 
 def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
@@ -325,7 +310,7 @@ def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
     return 0
 
 
-def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
+def run_gemini(args: argparse.Namespace) -> int:
     try:
         prompt = read_prompt(args.prompt, args.prompt_file).strip()
     except OSError as exc:
@@ -348,7 +333,23 @@ def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
         )
         return 2
 
-    print(f"Sending prompt to Gemini model {args.model!r} through proxy {args.proxy!r}...", file=sys.stderr)
+    if (
+        importlib.util.find_spec("google") is None
+        or importlib.util.find_spec("google.genai") is None
+    ):
+        print(
+            "The google-genai package is required. Install it with: "
+            "python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        f"Sending prompt to Gemini model {args.model!r} through proxy {args.proxy!r}...",
+        file=sys.stderr,
+    )
+
+    from google import genai
 
     try:
         output = call_gemini(
@@ -356,30 +357,16 @@ def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
             api_key=api_key,
             model=args.model,
             proxy_url=args.proxy,
-            timeout=args.timeout,
             temperature=args.temperature,
             max_output_tokens=args.max_output_tokens,
-            requests_module=requests_module,
+            genai_module=genai,
         )
-    except requests_module.exceptions.InvalidSchema as exc:
-        print(
-            "Gemini request failed because SOCKS support is missing.\n"
-            "Install it with: python -m pip install 'requests[socks]'\n"
-            f"Original error: {exc}",
-            file=sys.stderr,
-        )
-        return 2
-    except requests_module.HTTPError as exc:
-        body = exc.response.text if exc.response is not None else ""
-        print(f"Gemini request failed: {exc}\n{body}", file=sys.stderr)
-        return 1
-    except requests_module.RequestException as exc:
+    except Exception as exc:
         print(f"Gemini request failed: {exc}", file=sys.stderr)
         return 1
 
     print(output)
     return 0
-
 
 
 def normalize_args(raw_args: list[str]) -> list[str]:
@@ -400,14 +387,16 @@ def normalize_args(raw_args: list[str]) -> list[str]:
 
     return [*global_args, "test-proxy", *remaining]
 
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args(normalize_args(sys.argv[1:]))
     load_env_file(args.env_file)
 
-    try:
-        import requests
-    except ModuleNotFoundError:
+    if args.command == "gemini":
+        return run_gemini(args)
+
+    if importlib.util.find_spec("requests") is None:
         print(
             "The requests package is required. Install it with: "
             "python -m pip install -r requirements.txt",
@@ -415,8 +404,8 @@ def main() -> int:
         )
         return 2
 
-    if args.command == "gemini":
-        return run_gemini(args, requests)
+    import requests
+
     return run_proxy_test(args, requests)
 
 
