@@ -7,6 +7,12 @@ Usage examples:
     WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py test-proxy
 
     # Send a prompt to Gemini through warproxy. Put GEMINI_API_KEY in .env first.
+    cp .env.example .env
+    # Edit .env so it contains: GEMINI_API_KEY=your_real_api_key
+    python main.py gemini --prompt "hi" --model gemini-3.5-flash
+
+    # Or set the key only for the current shell/session instead of using .env:
+    export GEMINI_API_KEY="your_real_api_key"
     python main.py gemini --prompt "hi" --model gemini-3.5-flash
     python main.py gemini --prompt "Explain WARP in one sentence."
     python main.py gemini --model gemini-2.5-flash --prompt-file prompt.txt
