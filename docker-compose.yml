@@ -1,0 +1,22 @@
+services:
+  warproxy:
+    image: ghcr.io/kingcc/warproxy:latest
+    container_name: warproxy
+    restart: always
+    ports:
+      - "127.0.0.1:1080:1080"
+
+  proxy-test:
+    image: python:3.12-slim
+    profiles:
+      - test
+    depends_on:
+      - warproxy
+    working_dir: /app
+    volumes:
+      - .:/app:ro
+    environment:
+      WARPROXY_URL: socks5h://warproxy:1080
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt
+      && python main.py --retries 12 --retry-delay 5"

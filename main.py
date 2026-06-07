@@ -4,8 +4,9 @@ Usage examples:
     python main.py
     python main.py --proxy socks5h://myuser:mypassword@127.0.0.1:1080
     WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py
+    docker compose --profile test up --abort-on-container-exit proxy-test
 
-Install dependency first:
+Install dependency first, unless you use the Docker Compose test service:
     python -m pip install "requests[socks]"
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Any
 
 
@@ -43,6 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Request timeout in seconds. Defaults to 30.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of proxied request attempts. Useful while warproxy starts. Defaults to 1.",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between proxied request attempts. Defaults to 3.",
     )
     return parser
 
@@ -87,19 +101,35 @@ def main() -> int:
         )
         return 2
 
-    try:
-        direct_result = fetch_direct_ip(args.url, args.timeout, requests)
-        proxy_result = fetch_proxy_ip(args.url, args.proxy, args.timeout, requests)
-    except requests.exceptions.InvalidSchema as exc:
-        print(
-            "Proxy test failed because SOCKS support is missing.\n"
-            "Install it with: python -m pip install 'requests[socks]'\n"
-            f"Original error: {exc}",
-            file=sys.stderr,
-        )
-        return 2
-    except requests.RequestException as exc:
-        print(f"Proxy test failed: {exc}", file=sys.stderr)
+    direct_result = fetch_direct_ip(args.url, args.timeout, requests)
+
+    proxy_result = None
+    last_error: requests.RequestException | None = None
+    for attempt in range(1, args.retries + 1):
+        try:
+            proxy_result = fetch_proxy_ip(args.url, args.proxy, args.timeout, requests)
+            break
+        except requests.exceptions.InvalidSchema as exc:
+            print(
+                "Proxy test failed because SOCKS support is missing.\n"
+                "Install it with: python -m pip install 'requests[socks]'\n"
+                f"Original error: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= args.retries:
+                break
+            print(
+                f"Proxy attempt {attempt}/{args.retries} failed: {exc}. "
+                f"Retrying in {args.retry_delay:g}s...",
+                file=sys.stderr,
+            )
+            time.sleep(args.retry_delay)
+
+    if proxy_result is None:
+        print(f"Proxy test failed: {last_error}", file=sys.stderr)
         return 1
 
     print(f"Direct result: {direct_result if direct_result is not None else 'unavailable'}")
