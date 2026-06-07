@@ -32,4 +32,22 @@ services:
       - .env
     environment:
       WARPROXY_URL: socks5h://warproxy:1080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["gemini"]
+
+
+  ip-rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: warproxy-proxy-test:local
+    profiles:
+      - rotate
+    depends_on:
+      - warproxy
+    environment:
+      WARPROXY_URL: socks5h://warproxy:1080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["rotate-requests", "--count", "10", "--recreate"]

@@ -26,6 +26,8 @@ Usage examples:
 
     # Rotate warproxy before each request and verify 10 unique proxied IPs.
     python main.py rotate-requests --count 10 --recreate
+    docker compose --profile gemini run --rm --build gemini rotate-requests --count 10 --recreate
+    docker compose --profile rotate run --rm --build ip-rotator
 
 Install dependencies first, unless you use the Docker image or Compose services:
     python -m pip install -r requirements.txt
@@ -169,6 +171,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Docker Compose service to restart/recreate. Defaults to 'warproxy'.",
     )
     rotate_parser.add_argument(
+        "--container-name",
+        default="warproxy",
+        help=(
+            "Docker container name used by the in-container Docker SDK fallback. "
+            "Defaults to 'warproxy'."
+        ),
+    )
+    rotate_parser.add_argument(
         "--recreate",
         action="store_true",
         help="Use `docker compose up -d --force-recreate` instead of `docker compose restart`.",
@@ -219,6 +229,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--service",
         default="warproxy",
         help="Docker Compose service to restart/recreate. Defaults to 'warproxy'.",
+    )
+    rotate_requests_parser.add_argument(
+        "--container-name",
+        default="warproxy",
+        help=(
+            "Docker container name used by the in-container Docker SDK fallback. "
+            "Defaults to 'warproxy'."
+        ),
     )
     rotate_requests_parser.add_argument(
         "--recreate",
@@ -421,25 +439,60 @@ def build_compose_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def run_compose_command(command: list[str]) -> int:
-    """Run Docker Compose and return its exit code, with a clear Docker-missing error."""
+def restart_container_with_docker_sdk(args: argparse.Namespace) -> int:
+    """Restart warproxy through the Docker socket when Docker Compose is unavailable."""
+    if importlib.util.find_spec("docker") is None:
+        print(
+            "The docker package is required for in-container rotation fallback. "
+            "Install it with: python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    import docker
+
+    if args.recreate:
+        print(
+            "Docker Compose is unavailable, so falling back to Docker SDK restart. "
+            "This restarts the container but does not force-recreate it."
+        )
+
+    print(f"Restarting Docker container {args.container_name!r} through Docker SDK...")
+    client = docker.from_env()
+    try:
+        container = client.containers.get(args.container_name)
+        container.restart()
+    except Exception as exc:
+        print(f"Docker SDK restart failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
+
+    return 0
+
+
+def run_rotation_command(args: argparse.Namespace) -> int:
+    """Rotate warproxy with Docker Compose or an in-container Docker SDK fallback."""
+    command = build_compose_command(args)
     print(f"Running: {' '.join(command)}")
     try:
         completed = subprocess.run(command, check=False)
     except FileNotFoundError:
         print(
-            "Failed to run Docker Compose because the `docker` command was not found. "
-            "Run this command on the Docker host, or install Docker CLI.",
+            "Docker Compose CLI is not available; trying Docker SDK fallback.",
             file=sys.stderr,
         )
-        return 2
+        return restart_container_with_docker_sdk(args)
 
-    if completed.returncode != 0:
-        print(
-            f"Docker Compose command failed with exit code {completed.returncode}.",
-            file=sys.stderr,
-        )
-    return completed.returncode
+    if completed.returncode == 0:
+        return 0
+
+    print(
+        f"Docker Compose command failed with exit code {completed.returncode}; "
+        "trying Docker SDK fallback.",
+        file=sys.stderr,
+    )
+    return restart_container_with_docker_sdk(args)
 
 
 def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
@@ -456,8 +509,7 @@ def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
     before_ip = extract_ip(before_result)
     print(f"Proxy IP before rotation: {before_ip if before_ip else 'unavailable'}")
 
-    command = build_compose_command(args)
-    compose_exit_code = run_compose_command(command)
+    compose_exit_code = run_rotation_command(args)
     if compose_exit_code != 0:
         return compose_exit_code
 
@@ -508,7 +560,7 @@ def run_rotate_requests(args: argparse.Namespace, requests_module: Any) -> int:
     failures = 0
     for request_number in range(1, args.count + 1):
         print(f"\nRequest {request_number}/{args.count}: rotating {args.service!r}...")
-        compose_exit_code = run_compose_command(build_compose_command(args))
+        compose_exit_code = run_rotation_command(args)
         if compose_exit_code != 0:
             return compose_exit_code
 
