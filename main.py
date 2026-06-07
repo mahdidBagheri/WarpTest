@@ -4,9 +4,9 @@ Usage examples:
     python main.py
     python main.py --proxy socks5h://myuser:mypassword@127.0.0.1:1080
     WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py
-    docker compose --profile test up --abort-on-container-exit proxy-test
+    docker compose --profile test up --build --abort-on-container-exit proxy-test
 
-Install dependency first, unless you use the Docker Compose test service:
+Install dependency first, unless you use the Docker image or Compose test service:
     python -m pip install "requests[socks]"
 """
 
