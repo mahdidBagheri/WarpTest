@@ -1,13 +1,21 @@
-"""Test a local warproxy/Cloudflare WARP proxy from Python.
+"""Use Gemini through a local warproxy/Cloudflare WARP proxy from Python.
 
 Usage examples:
-    python main.py
-    python main.py --proxy socks5h://myuser:mypassword@127.0.0.1:1080
-    WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py
-    docker compose --profile test up --build --abort-on-container-exit proxy-test
+    # Verify that warproxy changes your egress IP.
+    python main.py test-proxy
+    python main.py test-proxy --proxy socks5h://myuser:mypassword@127.0.0.1:1080
+    WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py test-proxy
 
-Install dependency first, unless you use the Docker image or Compose test service:
-    python -m pip install "requests[socks]"
+    # Send a prompt to Gemini through warproxy. Put GEMINI_API_KEY in .env first.
+    python main.py gemini --prompt "Explain WARP in one sentence."
+    python main.py gemini --model gemini-2.5-flash --prompt-file prompt.txt
+    echo "Write a haiku about proxies" | python main.py gemini
+
+    docker compose --profile test up --build --abort-on-container-exit proxy-test
+    docker compose --profile gemini run --rm gemini gemini --prompt "Hello from Gemini"
+
+Install dependencies first, unless you use the Docker image or Compose services:
+    python -m pip install -r requirements.txt
 """
 
 from __future__ import annotations
@@ -16,29 +24,122 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_PROXY_URL = "socks5h://127.0.0.1:1080"
 DEFAULT_TEST_URL = "https://api.ipify.org?format=json"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def load_env_file(env_file: str) -> None:
+    """Load environment variables from a .env file when python-dotenv is installed."""
+    env_path = Path(env_file)
+    if not env_path.exists():
+        return
+
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        print(
+            "Warning: .env file found but python-dotenv is not installed. "
+            "Install dependencies with: python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return
+
+    load_dotenv(env_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Test whether HTTP/HTTPS requests are routed through warproxy."
+        description="Test warproxy or send Gemini prompts through warproxy."
     )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to the env file containing GEMINI_API_KEY. Defaults to '.env'.",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    proxy_parser = subparsers.add_parser(
+        "test-proxy",
+        help="Verify that HTTP/HTTPS requests are routed through warproxy.",
+    )
+    add_proxy_arguments(proxy_parser)
+    proxy_parser.add_argument(
+        "--url",
+        default=DEFAULT_TEST_URL,
+        help=f"URL used to verify the outgoing IP address. Defaults to {DEFAULT_TEST_URL!r}.",
+    )
+    proxy_parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of proxied request attempts. Useful while warproxy starts. Defaults to 1.",
+    )
+    proxy_parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between proxied request attempts. Defaults to 3.",
+    )
+
+    gemini_parser = subparsers.add_parser(
+        "gemini",
+        help="Send a prompt to Gemini and print the output through warproxy.",
+    )
+    add_proxy_arguments(gemini_parser)
+    gemini_parser.add_argument(
+        "--api-key-env",
+        default="GEMINI_API_KEY",
+        help="Environment variable containing the Gemini API key. Defaults to GEMINI_API_KEY.",
+    )
+    gemini_parser.add_argument(
+        "--model",
+        default=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        help=(
+            "Gemini model to call. Defaults to GEMINI_MODEL or "
+            f"{DEFAULT_GEMINI_MODEL!r}."
+        ),
+    )
+    gemini_parser.add_argument(
+        "--prompt",
+        help="Prompt text to send to Gemini. If omitted, stdin is used.",
+    )
+    gemini_parser.add_argument(
+        "--prompt-file",
+        help="Path to a UTF-8 file containing the prompt. Cannot be used with --prompt.",
+    )
+    gemini_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Optional Gemini sampling temperature.",
+    )
+    gemini_parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Optional maximum number of output tokens Gemini may return.",
+    )
+
+    # Backward compatible default: running `python main.py` still tests the proxy.
+    parser.set_defaults(command="test-proxy")
+    return parser
+
+
+def add_proxy_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--proxy",
         default=os.getenv("WARPROXY_URL", DEFAULT_PROXY_URL),
         help=(
-            "Proxy URL to test. Defaults to WARPROXY_URL or "
+            "Proxy URL to use. Defaults to WARPROXY_URL or "
             f"{DEFAULT_PROXY_URL!r}. Use socks5h:// so DNS also goes through the proxy."
         ),
-    )
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_TEST_URL,
-        help=f"URL used to verify the outgoing IP address. Defaults to {DEFAULT_TEST_URL!r}.",
     )
     parser.add_argument(
         "--timeout",
@@ -46,19 +147,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Request timeout in seconds. Defaults to 30.",
     )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=1,
-        help="Number of proxied request attempts. Useful while warproxy starts. Defaults to 1.",
-    )
-    parser.add_argument(
-        "--retry-delay",
-        type=float,
-        default=3.0,
-        help="Seconds to wait between proxied request attempts. Defaults to 3.",
-    )
-    return parser
+
+
+def build_proxies(proxy_url: str) -> dict[str, str]:
+    """Build a requests-compatible proxy map for HTTP and HTTPS."""
+    return {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
 
 
 def fetch_direct_ip(url: str, timeout: float, requests_module: Any) -> dict[str, Any] | None:
@@ -76,40 +172,114 @@ def fetch_proxy_ip(
     url: str, proxy_url: str, timeout: float, requests_module: Any
 ) -> dict[str, Any]:
     """Fetch the public IP through the configured proxy."""
-    proxies = {
-        "http": proxy_url,
-        "https": proxy_url,
-    }
-    response = requests_module.get(url, proxies=proxies, timeout=timeout)
+    response = requests_module.get(
+        url,
+        proxies=build_proxies(proxy_url),
+        timeout=timeout,
+    )
     response.raise_for_status()
     return response.json()
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def read_prompt(prompt: str | None, prompt_file: str | None) -> str:
+    """Read prompt text from --prompt, --prompt-file, or stdin."""
+    if prompt and prompt_file:
+        raise ValueError("Use either --prompt or --prompt-file, not both.")
 
+    if prompt_file:
+        return Path(prompt_file).read_text(encoding="utf-8")
+
+    if prompt is not None:
+        return prompt
+
+    if sys.stdin.isatty():
+        raise ValueError("Provide --prompt, --prompt-file, or pipe prompt text on stdin.")
+
+    return sys.stdin.read()
+
+
+def build_gemini_payload(
+    prompt: str,
+    temperature: float | None,
+    max_output_tokens: int | None,
+) -> dict[str, Any]:
+    """Create the Gemini generateContent JSON payload."""
+    payload: dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ]
+    }
+
+    generation_config: dict[str, Any] = {}
+    if temperature is not None:
+        generation_config["temperature"] = temperature
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max_output_tokens
+    if generation_config:
+        payload["generationConfig"] = generation_config
+
+    return payload
+
+
+def extract_gemini_text(response_json: dict[str, Any]) -> str:
+    """Extract text parts from a Gemini generateContent response."""
+    text_parts: list[str] = []
+    for candidate in response_json.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            text = part.get("text")
+            if text:
+                text_parts.append(text)
+
+    if text_parts:
+        return "\n".join(text_parts)
+
+    prompt_feedback = response_json.get("promptFeedback")
+    if prompt_feedback:
+        return f"Gemini returned no text. promptFeedback={prompt_feedback}"
+
+    return f"Gemini returned no text. Full response: {response_json}"
+
+
+def call_gemini(
+    prompt: str,
+    api_key: str,
+    model: str,
+    proxy_url: str,
+    timeout: float,
+    temperature: float | None,
+    max_output_tokens: int | None,
+    requests_module: Any,
+) -> str:
+    """Send a prompt to Gemini through the configured proxy and return generated text."""
+    endpoint = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
+    response = requests_module.post(
+        endpoint,
+        params={"key": api_key},
+        json=build_gemini_payload(prompt, temperature, max_output_tokens),
+        proxies=build_proxies(proxy_url),
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return extract_gemini_text(response.json())
+
+
+def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
     print(f"Testing proxy: {args.proxy}")
     print(f"Test URL: {args.url}")
 
-    try:
-        import requests
-    except ModuleNotFoundError:
-        print(
-            "The requests package is required. Install it with: "
-            "python -m pip install 'requests[socks]'",
-            file=sys.stderr,
-        )
-        return 2
-
-    direct_result = fetch_direct_ip(args.url, args.timeout, requests)
+    direct_result = fetch_direct_ip(args.url, args.timeout, requests_module)
 
     proxy_result = None
-    last_error: requests.RequestException | None = None
+    last_error: requests_module.RequestException | None = None
     for attempt in range(1, args.retries + 1):
         try:
-            proxy_result = fetch_proxy_ip(args.url, args.proxy, args.timeout, requests)
+            proxy_result = fetch_proxy_ip(args.url, args.proxy, args.timeout, requests_module)
             break
-        except requests.exceptions.InvalidSchema as exc:
+        except requests_module.exceptions.InvalidSchema as exc:
             print(
                 "Proxy test failed because SOCKS support is missing.\n"
                 "Install it with: python -m pip install 'requests[socks]'\n"
@@ -117,7 +287,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        except requests.RequestException as exc:
+        except requests_module.RequestException as exc:
             last_error = exc
             if attempt >= args.retries:
                 break
@@ -153,6 +323,101 @@ def main() -> int:
         print("Proxy request succeeded.")
 
     return 0
+
+
+def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
+    try:
+        prompt = read_prompt(args.prompt, args.prompt_file).strip()
+    except OSError as exc:
+        print(f"Failed to read prompt file: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if not prompt:
+        print("Prompt is empty.", file=sys.stderr)
+        return 2
+
+    api_key = os.getenv(args.api_key_env)
+    if not api_key:
+        print(
+            f"Missing Gemini API key. Add {args.api_key_env}=your_api_key to {args.env_file} "
+            f"or export {args.api_key_env} in your shell.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"Sending prompt to Gemini model {args.model!r} through proxy {args.proxy!r}...", file=sys.stderr)
+
+    try:
+        output = call_gemini(
+            prompt=prompt,
+            api_key=api_key,
+            model=args.model,
+            proxy_url=args.proxy,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            requests_module=requests_module,
+        )
+    except requests_module.exceptions.InvalidSchema as exc:
+        print(
+            "Gemini request failed because SOCKS support is missing.\n"
+            "Install it with: python -m pip install 'requests[socks]'\n"
+            f"Original error: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    except requests_module.HTTPError as exc:
+        body = exc.response.text if exc.response is not None else ""
+        print(f"Gemini request failed: {exc}\n{body}", file=sys.stderr)
+        return 1
+    except requests_module.RequestException as exc:
+        print(f"Gemini request failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(output)
+    return 0
+
+
+
+def normalize_args(raw_args: list[str]) -> list[str]:
+    """Keep old `python main.py --proxy ...` usage working by adding test-proxy."""
+    if any(arg in {"test-proxy", "gemini"} for arg in raw_args):
+        return raw_args
+    if any(arg in {"-h", "--help"} for arg in raw_args):
+        return raw_args
+
+    global_args: list[str] = []
+    remaining = list(raw_args)
+    if remaining and remaining[0] == "--env-file":
+        global_args = remaining[:2]
+        remaining = remaining[2:]
+    elif remaining and remaining[0].startswith("--env-file="):
+        global_args = remaining[:1]
+        remaining = remaining[1:]
+
+    return [*global_args, "test-proxy", *remaining]
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args(normalize_args(sys.argv[1:]))
+    load_env_file(args.env_file)
+
+    try:
+        import requests
+    except ModuleNotFoundError:
+        print(
+            "The requests package is required. Install it with: "
+            "python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.command == "gemini":
+        return run_gemini(args, requests)
+    return run_proxy_test(args, requests)
 
 
 if __name__ == "__main__":

@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py ./
 
 ENTRYPOINT ["python", "main.py"]
-CMD ["--retries", "12", "--retry-delay", "5"]
+CMD ["test-proxy", "--retries", "12", "--retry-delay", "5"]

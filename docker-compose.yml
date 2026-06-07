@@ -17,3 +17,19 @@ services:
       - warproxy
     environment:
       WARPROXY_URL: socks5h://warproxy:1080
+    command: ["test-proxy", "--retries", "12", "--retry-delay", "5"]
+
+  gemini:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: warproxy-proxy-test:local
+    profiles:
+      - gemini
+    depends_on:
+      - warproxy
+    env_file:
+      - .env
+    environment:
+      WARPROXY_URL: socks5h://warproxy:1080
+    command: ["gemini"]
