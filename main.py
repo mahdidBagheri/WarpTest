@@ -7,12 +7,27 @@ Usage examples:
     WARPROXY_URL=socks5h://127.0.0.1:1080 python main.py test-proxy
 
     # Send a prompt to Gemini through warproxy. Put GEMINI_API_KEY in .env first.
+    cp .env.example .env
+    # Edit .env so it contains: GEMINI_API_KEY=your_real_api_key
+    python main.py gemini --prompt "hi" --model gemini-3.5-flash
+
+    # Or set the key only for the current shell/session instead of using .env:
+    export GEMINI_API_KEY="your_real_api_key"
+    python main.py gemini --prompt "hi" --model gemini-3.5-flash
     python main.py gemini --prompt "Explain WARP in one sentence."
     python main.py gemini --model gemini-2.5-flash --prompt-file prompt.txt
     echo "Write a haiku about proxies" | python main.py gemini
 
     docker compose --profile test up --build --abort-on-container-exit proxy-test
-    docker compose --profile gemini run --rm gemini gemini --prompt "Hello from Gemini"
+    docker compose --profile gemini run --rm gemini --prompt "hi"
+
+    # Ask Docker Compose to restart/recreate warproxy, then verify the proxy IP.
+    python main.py rotate-warproxy --recreate
+
+    # Rotate warproxy before each request and verify 10 unique proxied IPs.
+    python main.py rotate-requests --count 10 --recreate
+    docker compose --profile gemini run --rm --build gemini rotate-requests --count 10 --recreate
+    docker compose --profile rotate run --rm --build ip-rotator
 
 Install dependencies first, unless you use the Docker image or Compose services:
     python -m pip install -r requirements.txt
@@ -21,7 +36,9 @@ Install dependencies first, unless you use the Docker image or Compose services:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,8 +47,7 @@ from typing import Any
 
 DEFAULT_PROXY_URL = "socks5h://127.0.0.1:1080"
 DEFAULT_TEST_URL = "https://api.ipify.org?format=json"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 
 def load_env_file(env_file: str) -> None:
@@ -40,15 +56,15 @@ def load_env_file(env_file: str) -> None:
     if not env_path.exists():
         return
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError:
+    if importlib.util.find_spec("dotenv") is None:
         print(
             "Warning: .env file found but python-dotenv is not installed. "
             "Install dependencies with: python -m pip install -r requirements.txt",
             file=sys.stderr,
         )
         return
+
+    from dotenv import load_dotenv
 
     load_dotenv(env_path)
 
@@ -127,6 +143,117 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional maximum number of output tokens Gemini may return.",
     )
 
+    rotate_parser = subparsers.add_parser(
+        "rotate-warproxy",
+        help="Restart or recreate warproxy and check whether the proxy IP changes.",
+    )
+    add_proxy_arguments(rotate_parser)
+    rotate_parser.add_argument(
+        "--url",
+        default=DEFAULT_TEST_URL,
+        help=f"URL used to verify the outgoing IP address. Defaults to {DEFAULT_TEST_URL!r}.",
+    )
+    rotate_parser.add_argument(
+        "--retries",
+        type=int,
+        default=12,
+        help="Number of post-rotation proxy check attempts. Defaults to 12.",
+    )
+    rotate_parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between post-rotation proxy checks. Defaults to 5.",
+    )
+    rotate_parser.add_argument(
+        "--service",
+        default="warproxy",
+        help="Docker Compose service to restart/recreate. Defaults to 'warproxy'.",
+    )
+    rotate_parser.add_argument(
+        "--container-name",
+        default="warproxy",
+        help=(
+            "Docker container name used by the in-container Docker SDK fallback. "
+            "Defaults to 'warproxy'."
+        ),
+    )
+    rotate_parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Use `docker compose up -d --force-recreate` instead of `docker compose restart`.",
+    )
+    rotate_parser.add_argument(
+        "--compose-file",
+        action="append",
+        default=[],
+        help="Optional docker-compose.yml path. Can be provided more than once.",
+    )
+    rotate_parser.add_argument(
+        "--project-directory",
+        help="Optional Docker Compose project directory to pass through.",
+    )
+
+    rotate_requests_parser = subparsers.add_parser(
+        "rotate-requests",
+        help="Rotate warproxy before each request and verify the proxied IPs are unique.",
+    )
+    add_proxy_arguments(rotate_requests_parser)
+    rotate_requests_parser.add_argument(
+        "--url",
+        default=DEFAULT_TEST_URL,
+        help=(
+            "URL to request through the proxy. It must return JSON with an 'ip' "
+            f"field for verification. Defaults to {DEFAULT_TEST_URL!r}."
+        ),
+    )
+    rotate_requests_parser.add_argument(
+        "--count",
+        type=int,
+        default=10,
+        help="Number of rotate-and-request attempts to run. Defaults to 10.",
+    )
+    rotate_requests_parser.add_argument(
+        "--retries",
+        type=int,
+        default=12,
+        help="Number of post-rotation proxy check attempts per request. Defaults to 12.",
+    )
+    rotate_requests_parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between post-rotation proxy checks. Defaults to 5.",
+    )
+    rotate_requests_parser.add_argument(
+        "--service",
+        default="warproxy",
+        help="Docker Compose service to restart/recreate. Defaults to 'warproxy'.",
+    )
+    rotate_requests_parser.add_argument(
+        "--container-name",
+        default="warproxy",
+        help=(
+            "Docker container name used by the in-container Docker SDK fallback. "
+            "Defaults to 'warproxy'."
+        ),
+    )
+    rotate_requests_parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Use `docker compose up -d --force-recreate` instead of `docker compose restart`.",
+    )
+    rotate_requests_parser.add_argument(
+        "--compose-file",
+        action="append",
+        default=[],
+        help="Optional docker-compose.yml path. Can be provided more than once.",
+    )
+    rotate_requests_parser.add_argument(
+        "--project-directory",
+        help="Optional Docker Compose project directory to pass through.",
+    )
+
     # Backward compatible default: running `python main.py` still tests the proxy.
     parser.set_defaults(command="test-proxy")
     return parser
@@ -198,50 +325,34 @@ def read_prompt(prompt: str | None, prompt_file: str | None) -> str:
     return sys.stdin.read()
 
 
-def build_gemini_payload(
-    prompt: str,
+def build_genai_client(api_key: str, proxy_url: str, genai_module: Any) -> Any:
+    """Create a Google Gen AI SDK client configured for warproxy."""
+    http_options = {
+        "client_args": {"proxy": proxy_url},
+        "async_client_args": {"proxy": proxy_url},
+    }
+    return genai_module.Client(api_key=api_key, http_options=http_options)
+
+
+def build_generation_config(
     temperature: float | None,
     max_output_tokens: int | None,
-) -> dict[str, Any]:
-    """Create the Gemini generateContent JSON payload."""
-    payload: dict[str, Any] = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ]
-    }
-
+) -> dict[str, Any] | None:
+    """Create optional Google Gen AI SDK generation config values."""
     generation_config: dict[str, Any] = {}
     if temperature is not None:
         generation_config["temperature"] = temperature
     if max_output_tokens is not None:
-        generation_config["maxOutputTokens"] = max_output_tokens
-    if generation_config:
-        payload["generationConfig"] = generation_config
-
-    return payload
+        generation_config["max_output_tokens"] = max_output_tokens
+    return generation_config or None
 
 
-def extract_gemini_text(response_json: dict[str, Any]) -> str:
-    """Extract text parts from a Gemini generateContent response."""
-    text_parts: list[str] = []
-    for candidate in response_json.get("candidates", []):
-        content = candidate.get("content", {})
-        for part in content.get("parts", []):
-            text = part.get("text")
-            if text:
-                text_parts.append(text)
-
-    if text_parts:
-        return "\n".join(text_parts)
-
-    prompt_feedback = response_json.get("promptFeedback")
-    if prompt_feedback:
-        return f"Gemini returned no text. promptFeedback={prompt_feedback}"
-
-    return f"Gemini returned no text. Full response: {response_json}"
+def extract_gemini_text(response: Any) -> str:
+    """Extract text from a Google Gen AI SDK generate_content response."""
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    return f"Gemini returned no text. Full response: {response}"
 
 
 def call_gemini(
@@ -249,22 +360,256 @@ def call_gemini(
     api_key: str,
     model: str,
     proxy_url: str,
-    timeout: float,
     temperature: float | None,
     max_output_tokens: int | None,
-    requests_module: Any,
+    genai_module: Any,
 ) -> str:
     """Send a prompt to Gemini through the configured proxy and return generated text."""
-    endpoint = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
-    response = requests_module.post(
-        endpoint,
-        params={"key": api_key},
-        json=build_gemini_payload(prompt, temperature, max_output_tokens),
-        proxies=build_proxies(proxy_url),
-        timeout=timeout,
+    client = build_genai_client(api_key, proxy_url, genai_module)
+    config = build_generation_config(temperature, max_output_tokens)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "contents": prompt,
+    }
+    if config is not None:
+        kwargs["config"] = config
+
+    response = client.models.generate_content(**kwargs)
+    return extract_gemini_text(response)
+
+
+def extract_ip(result: dict[str, Any] | None) -> str | None:
+    """Return the `ip` value from an IP check response, when present."""
+    if isinstance(result, dict):
+        ip_address = result.get("ip")
+        if isinstance(ip_address, str):
+            return ip_address
+    return None
+
+
+def fetch_proxy_ip_with_retries(
+    url: str,
+    proxy_url: str,
+    timeout: float,
+    retries: int,
+    retry_delay: float,
+    requests_module: Any,
+) -> dict[str, Any] | None:
+    """Fetch the proxied IP, retrying while warproxy starts or reconnects."""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fetch_proxy_ip(url, proxy_url, timeout, requests_module)
+        except requests_module.exceptions.InvalidSchema as exc:
+            print(
+                "Proxy request failed because SOCKS support is missing.\n"
+                "Install it with: python -m pip install 'requests[socks]'\n"
+                f"Original error: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        except requests_module.RequestException as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            print(
+                f"Proxy attempt {attempt}/{retries} failed: {exc}. "
+                f"Retrying in {retry_delay:g}s...",
+                file=sys.stderr,
+            )
+            time.sleep(retry_delay)
+
+    print(f"Proxy request failed: {last_error}", file=sys.stderr)
+    return None
+
+
+def build_compose_command(args: argparse.Namespace) -> list[str]:
+    """Build the Docker Compose command used to rotate warproxy."""
+    command = ["docker", "compose"]
+    for compose_file in args.compose_file:
+        command.extend(["--file", compose_file])
+    if args.project_directory:
+        command.extend(["--project-directory", args.project_directory])
+
+    if args.recreate:
+        command.extend(["up", "-d", "--force-recreate", args.service])
+    else:
+        command.extend(["restart", args.service])
+
+    return command
+
+
+def restart_container_with_docker_sdk(args: argparse.Namespace) -> int:
+    """Restart warproxy through the Docker socket when Docker Compose is unavailable."""
+    if importlib.util.find_spec("docker") is None:
+        print(
+            "The docker package is required for in-container rotation fallback. "
+            "Install it with: python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    import docker
+
+    if args.recreate:
+        print(
+            "Docker Compose is unavailable, so falling back to Docker SDK restart. "
+            "This restarts the container but does not force-recreate it."
+        )
+
+    print(f"Restarting Docker container {args.container_name!r} through Docker SDK...")
+    client = docker.from_env()
+    try:
+        container = client.containers.get(args.container_name)
+        container.restart()
+    except Exception as exc:
+        print(f"Docker SDK restart failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
+
+    return 0
+
+
+def run_rotation_command(args: argparse.Namespace) -> int:
+    """Rotate warproxy with Docker Compose or an in-container Docker SDK fallback."""
+    command = build_compose_command(args)
+    print(f"Running: {' '.join(command)}")
+    try:
+        completed = subprocess.run(command, check=False)
+    except FileNotFoundError:
+        print(
+            "Docker Compose CLI is not available; trying Docker SDK fallback.",
+            file=sys.stderr,
+        )
+        return restart_container_with_docker_sdk(args)
+
+    if completed.returncode == 0:
+        return 0
+
+    print(
+        f"Docker Compose command failed with exit code {completed.returncode}; "
+        "trying Docker SDK fallback.",
+        file=sys.stderr,
     )
-    response.raise_for_status()
-    return extract_gemini_text(response.json())
+    return restart_container_with_docker_sdk(args)
+
+
+def run_rotate_warproxy(args: argparse.Namespace, requests_module: Any) -> int:
+    """Restart/recreate warproxy and report whether the proxied IP changed."""
+    print(f"Checking proxy IP before rotating {args.service!r}...")
+    before_result = fetch_proxy_ip_with_retries(
+        args.url,
+        args.proxy,
+        args.timeout,
+        retries=1,
+        retry_delay=args.retry_delay,
+        requests_module=requests_module,
+    )
+    before_ip = extract_ip(before_result)
+    print(f"Proxy IP before rotation: {before_ip if before_ip else 'unavailable'}")
+
+    compose_exit_code = run_rotation_command(args)
+    if compose_exit_code != 0:
+        return compose_exit_code
+
+    print(f"Waiting for proxy {args.proxy!r} after rotation...")
+    after_result = fetch_proxy_ip_with_retries(
+        args.url,
+        args.proxy,
+        args.timeout,
+        args.retries,
+        args.retry_delay,
+        requests_module,
+    )
+    after_ip = extract_ip(after_result)
+    print(f"Proxy IP after rotation:  {after_ip if after_ip else 'unavailable'}")
+
+    if not after_ip:
+        return 1
+    if before_ip and before_ip != after_ip:
+        print("Success: proxy IP changed after rotating warproxy.")
+    elif before_ip == after_ip:
+        print(
+            "warproxy restarted successfully, but the proxy IP did not change. "
+            "Cloudflare WARP chooses the egress IP, so a restart/recreate cannot "
+            "guarantee a new IP every time."
+        )
+    else:
+        print("warproxy rotation completed and the proxy is responding.")
+
+    return 0
+
+
+def run_rotate_requests(args: argparse.Namespace, requests_module: Any) -> int:
+    """Rotate warproxy before each request and verify every observed IP is unique."""
+    if args.count < 1:
+        print("--count must be at least 1.", file=sys.stderr)
+        return 2
+
+    print(
+        f"Sending {args.count} proxied request(s) to {args.url!r}, "
+        f"rotating {args.service!r} before each request."
+    )
+    print(
+        "Note: Cloudflare WARP chooses the egress IP; rotating warproxy cannot "
+        "guarantee a new IP every time."
+    )
+
+    observed_ips: list[str] = []
+    failures = 0
+    for request_number in range(1, args.count + 1):
+        print(f"\nRequest {request_number}/{args.count}: rotating {args.service!r}...")
+        compose_exit_code = run_rotation_command(args)
+        if compose_exit_code != 0:
+            return compose_exit_code
+
+        result = fetch_proxy_ip_with_retries(
+            args.url,
+            args.proxy,
+            args.timeout,
+            args.retries,
+            args.retry_delay,
+            requests_module,
+        )
+        ip_address = extract_ip(result)
+        if not ip_address:
+            failures += 1
+            print(f"Request {request_number}: FAILED no 'ip' field in response: {result}")
+            continue
+
+        is_duplicate = ip_address in observed_ips
+        previous_ip = observed_ips[-1] if observed_ips else None
+        changed = previous_ip is None or ip_address != previous_ip
+        observed_ips.append(ip_address)
+        print(
+            f"Request {request_number}: ip={ip_address} "
+            f"changed_from_previous={'n/a' if previous_ip is None else changed} "
+            f"unique_so_far={not is_duplicate}"
+        )
+        if is_duplicate:
+            failures += 1
+
+    unique_ips = list(dict.fromkeys(observed_ips))
+    print("\nObserved proxied IPs:")
+    for index, ip_address in enumerate(observed_ips, start=1):
+        duplicate_marker = (
+            " (duplicate)" if observed_ips.index(ip_address) != index - 1 else ""
+        )
+        print(f"  {index:02d}. {ip_address}{duplicate_marker}")
+
+    if failures:
+        print(
+            f"IP rotation verification failed: saw {len(unique_ips)} unique IP(s) "
+            f"across {args.count} request(s)."
+        )
+        return 1
+
+    print(
+        f"Success: all {args.count} proxied request(s) used unique IPs "
+        "after warproxy rotation."
+    )
+    return 0
 
 
 def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
@@ -305,8 +650,8 @@ def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
     print(f"Direct result: {direct_result if direct_result is not None else 'unavailable'}")
     print(f"Proxy result:  {proxy_result}")
 
-    direct_ip = direct_result.get("ip") if isinstance(direct_result, dict) else None
-    proxy_ip = proxy_result.get("ip") if isinstance(proxy_result, dict) else None
+    direct_ip = extract_ip(direct_result)
+    proxy_ip = extract_ip(proxy_result)
 
     if not proxy_ip:
         print("Proxy request succeeded, but the response did not include an 'ip' field.")
@@ -325,7 +670,7 @@ def run_proxy_test(args: argparse.Namespace, requests_module: Any) -> int:
     return 0
 
 
-def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
+def run_gemini(args: argparse.Namespace) -> int:
     try:
         prompt = read_prompt(args.prompt, args.prompt_file).strip()
     except OSError as exc:
@@ -348,7 +693,23 @@ def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
         )
         return 2
 
-    print(f"Sending prompt to Gemini model {args.model!r} through proxy {args.proxy!r}...", file=sys.stderr)
+    if (
+        importlib.util.find_spec("google") is None
+        or importlib.util.find_spec("google.genai") is None
+    ):
+        print(
+            "The google-genai package is required. Install it with: "
+            "python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        f"Sending prompt to Gemini model {args.model!r} through proxy {args.proxy!r}...",
+        file=sys.stderr,
+    )
+
+    from google import genai
 
     try:
         output = call_gemini(
@@ -356,24 +717,11 @@ def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
             api_key=api_key,
             model=args.model,
             proxy_url=args.proxy,
-            timeout=args.timeout,
             temperature=args.temperature,
             max_output_tokens=args.max_output_tokens,
-            requests_module=requests_module,
+            genai_module=genai,
         )
-    except requests_module.exceptions.InvalidSchema as exc:
-        print(
-            "Gemini request failed because SOCKS support is missing.\n"
-            "Install it with: python -m pip install 'requests[socks]'\n"
-            f"Original error: {exc}",
-            file=sys.stderr,
-        )
-        return 2
-    except requests_module.HTTPError as exc:
-        body = exc.response.text if exc.response is not None else ""
-        print(f"Gemini request failed: {exc}\n{body}", file=sys.stderr)
-        return 1
-    except requests_module.RequestException as exc:
+    except Exception as exc:
         print(f"Gemini request failed: {exc}", file=sys.stderr)
         return 1
 
@@ -381,10 +729,30 @@ def run_gemini(args: argparse.Namespace, requests_module: Any) -> int:
     return 0
 
 
+GEMINI_OPTION_NAMES = {
+    "--api-key-env",
+    "--max-output-tokens",
+    "--model",
+    "--prompt",
+    "--prompt-file",
+    "--temperature",
+}
+
+
+def option_name(arg: str) -> str:
+    """Return an argparse option name without any inline value."""
+    return arg.split("=", 1)[0]
+
 
 def normalize_args(raw_args: list[str]) -> list[str]:
-    """Keep old `python main.py --proxy ...` usage working by adding test-proxy."""
-    if any(arg in {"test-proxy", "gemini"} for arg in raw_args):
+    """Add the most likely subcommand when callers omit it.
+
+    This keeps old `python main.py --proxy ...` usage working as `test-proxy`,
+    and lets Docker Compose users run `docker compose ... gemini --prompt hi`
+    even though Compose replaces the service command when extra args are given.
+    """
+    known_commands = {"test-proxy", "gemini", "rotate-warproxy", "rotate-requests"}
+    if any(arg in known_commands for arg in raw_args):
         return raw_args
     if any(arg in {"-h", "--help"} for arg in raw_args):
         return raw_args
@@ -398,16 +766,24 @@ def normalize_args(raw_args: list[str]) -> list[str]:
         global_args = remaining[:1]
         remaining = remaining[1:]
 
-    return [*global_args, "test-proxy", *remaining]
+    command = "gemini" if is_gemini_command(remaining) else "test-proxy"
+    return [*global_args, command, *remaining]
+
+
+def is_gemini_command(args: list[str]) -> bool:
+    """Infer the Gemini subcommand when Gemini-only options are present."""
+    return any(option_name(arg) in GEMINI_OPTION_NAMES for arg in args)
+
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args(normalize_args(sys.argv[1:]))
     load_env_file(args.env_file)
 
-    try:
-        import requests
-    except ModuleNotFoundError:
+    if args.command == "gemini":
+        return run_gemini(args)
+
+    if importlib.util.find_spec("requests") is None:
         print(
             "The requests package is required. Install it with: "
             "python -m pip install -r requirements.txt",
@@ -415,8 +791,12 @@ def main() -> int:
         )
         return 2
 
-    if args.command == "gemini":
-        return run_gemini(args, requests)
+    import requests
+
+    if args.command == "rotate-warproxy":
+        return run_rotate_warproxy(args, requests)
+    if args.command == "rotate-requests":
+        return run_rotate_requests(args, requests)
     return run_proxy_test(args, requests)
 
 
